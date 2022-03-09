@@ -5,7 +5,7 @@
 extern struct uwsgi_server uwsgi;
 
 #define DOCKER_SOCKET "/var/run/docker.sock"
-#define DOCKER_API "1.14"
+#define DOCKER_API "1.24"
 
 static struct uwsgi_docker {
 	int emperor;
@@ -34,7 +34,7 @@ static curl_socket_t docker_unix_socket(void *foobar, curlsocktype cs_type, stru
 
 	memset(un_addr, 0, c_addr->addrlen);
 	un_addr->sun_family = AF_UNIX;
-	strncpy(un_addr->sun_path, udocker.socket, sizeof(un_addr->sun_path));
+	memcpy(un_addr->sun_path, udocker.socket, sizeof(un_addr->sun_path));
 	c_addr->protocol = 0;
 	return socket(c_addr->family, c_addr->socktype, c_addr->protocol);
 }
@@ -205,14 +205,23 @@ static void docker_attach(struct uwsgi_instance *ui, int proxy_fd, char *proxy_p
 	unlink(proxy_path);
 
 	int fd = uwsgi_connect(udocker.socket, uwsgi.socket_timeout, 0);
-	if (fd < 0) goto end;
+	if (fd < 0) {
+		if (udocker.debug) {
+			uwsgi_log("[docker-debug] uwsgi_connect failed. fd: %s", fd);
+		}		
+		goto end; 
+	}
 
 	// send a raw request, we do not need curl this time
 	// ub structure us not freed on error, as we brutally exit
 	struct uwsgi_buffer *ub = uwsgi_buffer_new(uwsgi.page_size);
 	if (uwsgi_buffer_append(ub, "POST /containers/", 17)) goto end;
 	if (uwsgi_buffer_append(ub, container_id, strlen(container_id))) goto end;
-	if (uwsgi_buffer_append(ub, "/attach?stream=1&logs=1&stdin=1&stdout=1&stderr=1 HTTP/1.1\r\n\r\n", 62)) goto end;
+	if (uwsgi_buffer_append(ub, "/attach?stream=1&logs=1&stdin=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: localhost\r\n\r\n", 79)) goto end;
+	//if (uwsgi_buffer_append(ub, "Host: localhost\r\n\r\n", 19)) goto end;
+	if (udocker.debug) {
+			uwsgi_log("[docker-debug] raw attach request.\n");
+		}		
 	if (uwsgi_write_nb(fd, ub->buf, ub->pos, uwsgi.socket_timeout)) {
 		uwsgi_error("docker_attach()/write()");
 		goto end;
@@ -445,6 +454,43 @@ static void docker_run(struct uwsgi_instance *ui, char **argv) {
 
 	if (json_object_set(root, "Cmd", cmd)) exit(1);
 
+	json_t *hostconfig = json_object();
+
+	// Volumes/Binds
+	json_t *binds = json_array();
+        if (vassal_attr_get_multi(ui, "docker-mount", docker_add_item_to_array, binds)) {
+                uwsgi_log("[docker] unable to build volumes mapping for vassal %s\n", ui->name);
+                exit(1);
+        }
+	char *proxy_bind = uwsgi_concat3(proxy_attr_emperor, ":", proxy_attr_docker);
+	json_array_append(binds, json_string(proxy_bind));
+	free(proxy_bind);
+	json_object_set(hostconfig, "Binds", binds);
+
+	// Dns
+	json_t *dns = json_array();
+	if (vassal_attr_get_multi(ui, "docker-dns", docker_add_item_to_array, dns)) {
+                uwsgi_log("[docker] unable to build dns list for vassal %s\n", ui->name);
+                exit(1);
+        }
+	json_object_set(hostconfig, "Dns", dns);
+
+
+	// PortBindings
+	ports = json_object();
+        if (vassal_attr_get_multi(ui, "docker-port", docker_add_port, ports)) {
+                uwsgi_log("[docker] unable to build port mapping for vassal %s\n", ui->name);
+                exit(1);
+        }
+        if (json_object_set(hostconfig, "PortBindings", ports)) exit(1);
+
+	char *docker_network_mode = vassal_attr_get(ui, "docker-network-mode");
+	if (docker_network_mode) {
+                if (json_object_set(hostconfig, "NetworkMode", json_string(docker_network_mode))) exit(1);
+        }
+
+	if (json_object_set(root, "HostConfig", hostconfig)) exit(1);
+
 	char *container_id = NULL;
 	json_t *garbage = NULL;
 
@@ -516,7 +562,7 @@ static void docker_run(struct uwsgi_instance *ui, char **argv) {
 	json_decref(root);
 	// and now we sart the docker instance
 	root = json_object();
-
+	/*
 	// Volumes/Binds
 	json_t *binds = json_array();
         if (vassal_attr_get_multi(ui, "docker-mount", docker_add_item_to_array, binds)) {
@@ -549,13 +595,14 @@ static void docker_run(struct uwsgi_instance *ui, char **argv) {
 	if (docker_network_mode) {
                 if (json_object_set(root, "NetworkMode", json_string(docker_network_mode))) exit(1);
         }
+	*/	
 
 	long http_status = 0;
 	char *url = uwsgi_concat3("/containers/", container_id, "/start");
 	if (udocker.debug) {
 		uwsgi_log("[docker-debug] POST %s\n%s\n", url, json_dumps(root, 0));
 	}
-	json_t *response = docker_json("POST", url, root, &http_status);
+	json_t *response = docker_json("POST", url, json_object(), &http_status);
 	free(url);
 	if (http_status != 204) {
 		uwsgi_log("[docker] unable to start container %s (%s)\n", container_id, ui->name);
